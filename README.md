@@ -1,0 +1,2 @@
+# golos.bot
+bot
