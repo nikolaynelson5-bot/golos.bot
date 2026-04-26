@@ -7,8 +7,11 @@ import re
 import asyncio
 from typing import List
 from discord.ui import Button, View, Modal, TextInput
+from dotenv import load_dotenv
 
-TOKEN = 'MTQ5MDQyMTU3OTU5Nzc0NjE4Ng.GDAk31.dXnGpCCjCtmShzWocLglhibjHDvJbt2KWab7D4'
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.all()
 
