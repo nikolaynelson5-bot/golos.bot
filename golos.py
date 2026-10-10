@@ -3177,7 +3177,7 @@ async def clear(interaction: discord.Interaction, amount: int, user: discord.Mem
 
 
 if __name__ == "__main__":
-    TOKEN = "MTQ5MDQyMTU3OTU5Nzc0NjE4Ng.GT3UJE.jfaSgTCstuaPSHb_6iO-t6_6BQN1z6lpX4_Xq4"
+    TOKEN = os.getenv ("DISCORD_TOKEN")
     if not TOKEN:
         print("Коля пизда.")
     else:
