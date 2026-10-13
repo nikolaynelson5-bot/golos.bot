@@ -1,0 +1,34 @@
+{
+    "logs": [
+        {
+            "user": "bydemort",
+            "action": "login",
+            "details": "Вход в панель",
+            "time": 1791896294.816361
+        },
+        {
+            "user": "bydemort",
+            "action": "ticket_verdict",
+            "details": "complaint `№ 00001` → ЕУЫ",
+            "time": 1791900729.734128
+        },
+        {
+            "user": "bydemort",
+            "action": "ticket_verdict",
+            "details": "complaint `№ 00001` → ЕУЫ",
+            "time": 1791900731.296914
+        },
+        {
+            "user": "bydemort",
+            "action": "ticket_verdict",
+            "details": "complaint `№ 00001` → ЕУЫ",
+            "time": 1791900731.440268
+        },
+        {
+            "user": "bydemort",
+            "action": "login",
+            "details": "Вход в панель",
+            "time": 1791900767.325757
+        }
+    ]
+}
