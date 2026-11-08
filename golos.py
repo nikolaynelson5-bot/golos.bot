@@ -7,7 +7,54 @@ import json
 import os
 import re
 import time
-import hashlib
+import sys
+import socket
+import sqlite3
+
+try:
+    _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _lock_socket.bind(('127.0.0.1', 54321))
+except socket.error:
+    print("="*70)
+    print("ОШИБКА: Бот уже запущен в другом окне терминала!")
+    print("Закрой ВСЕ старые окна терминала и запусти заново.")
+    print("="*70)
+    sys.exit(1)
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+class LogManager:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        try:
+            with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+                conn.execute("CREATE TABLE IF NOT EXISTS dedup (key TEXT PRIMARY KEY, timestamp REAL)")
+                conn.commit()
+        except Exception as e:
+            print(f"[LOG MANAGER INIT ERROR] {e}")
+
+    def is_duplicate(self, key, window=15.0):
+        now = time.time()
+        try:
+            with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("DELETE FROM dedup WHERE timestamp < ?", (now - 120,))
+                cursor = conn.execute("SELECT timestamp FROM dedup WHERE key = ?", (key,))
+                row = cursor.fetchone()
+                if row and (now - row[0]) < window:
+                    conn.rollback()
+                    return True
+                conn.execute("INSERT OR REPLACE INTO dedup (key, timestamp) VALUES (?, ?)", (key, now))
+                conn.commit()
+                return False
+        except Exception as e:
+            print(f"[LOG MANAGER ERROR] {e}")
+            return False
+
+log_manager = LogManager(os.path.join(SCRIPT_DIR, "bot_logs.db"))
 
 intents = discord.Intents.default()
 intents.members = True
@@ -19,14 +66,14 @@ intents.guild_messages = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-WARN_FILE = "warns.json"
-SPAM_FILE = "spam.json"
-TICKET_FILE = "tickets.json"
-TIKET_FILE = "tikets.json"
-PUNISHMENT_APPEAL_FILE = "punishment_appeals.json"
-GLOBAL_COUNTER_FILE = "global_counter.json"
-TEMPBAN_FILE = "tempbans.json"
-RAID_STATE_FILE = "raid_state.json"
+WARN_FILE = os.path.join(SCRIPT_DIR, "warns.json")
+SPAM_FILE = os.path.join(SCRIPT_DIR, "spam.json")
+TICKET_FILE = os.path.join(SCRIPT_DIR, "tickets.json")
+TIKET_FILE = os.path.join(SCRIPT_DIR, "tikets.json")
+PUNISHMENT_APPEAL_FILE = os.path.join(SCRIPT_DIR, "punishment_appeals.json")
+GLOBAL_COUNTER_FILE = os.path.join(SCRIPT_DIR, "global_counter.json")
+TEMPBAN_FILE = os.path.join(SCRIPT_DIR, "tempbans.json")
+RAID_STATE_FILE = os.path.join(SCRIPT_DIR, "raid_state.json")
 
 MAX_WARNS = 3
 WARN_MUTE_DURATION = 12 * 3600
@@ -82,6 +129,10 @@ TICKET_PING_ROLE_2 = ADMIN_ROLE_ID
 TIKET_PING_ROLE = TIKET_PING_ROLE_ID
 MODERATION_PING_ROLE = MODERATOR_ROLE_ID
 
+FORMSTATEMENT_CHANNEL_ID = 1568714654090264586
+FORMSTATEMENT_ROLE_1 = 1491372311310368818
+FORMSTATEMENT_ROLE_2 = 1508078492552663141
+
 GROUP_TICKET_MOD = [TICKET_MODERATOR_ROLE_ID]
 GROUP_ADMIN = [ADMIN_ROLE_ID]
 GROUP_MOD = [MODERATOR_ROLE_ID]
@@ -118,61 +169,7 @@ _synced_once = False
 _on_ready_count = 0
 _view_registry = set()
 
-_log_dedup_cache = {}
-_LOG_DEDUP_WINDOW = 3.0
-_deleted_message_cache = {}
-_edited_message_cache = {}
-_DELETE_DEDUP_WINDOW = 5.0
-_EDIT_DEDUP_WINDOW = 5.0
-
 _global_counter_lock = asyncio.Lock()
-
-
-def _make_dedup_key(channel_id, title, fields, footer):
-    parts = [str(channel_id), str(title)]
-    if fields:
-        for f in fields:
-            parts.append(repr(f))
-    if footer:
-        parts.append(str(footer))
-    return hashlib.md5("|".join(parts).encode('utf-8', errors='ignore')).hexdigest()
-
-
-def _should_send_log(channel_id, dedup_key):
-    now = time.time()
-    expired = [k for k, t in _log_dedup_cache.items() if now - t > _LOG_DEDUP_WINDOW * 4]
-    for k in expired:
-        _log_dedup_cache.pop(k, None)
-    full_key = f"{channel_id}:{dedup_key}"
-    if full_key in _log_dedup_cache:
-        if now - _log_dedup_cache[full_key] < _LOG_DEDUP_WINDOW:
-            return False
-    _log_dedup_cache[full_key] = now
-    return True
-
-
-def _should_process_deleted(message_id):
-    now = time.time()
-    expired = [k for k, t in _deleted_message_cache.items() if now - t > _DELETE_DEDUP_WINDOW * 4]
-    for k in expired:
-        _deleted_message_cache.pop(k, None)
-    if message_id in _deleted_message_cache:
-        if now - _deleted_message_cache[message_id] < _DELETE_DEDUP_WINDOW:
-            return False
-    _deleted_message_cache[message_id] = now
-    return True
-
-
-def _should_process_edited(message_id):
-    now = time.time()
-    expired = [k for k, t in _edited_message_cache.items() if now - t > _EDIT_DEDUP_WINDOW * 4]
-    for k in expired:
-        _edited_message_cache.pop(k, None)
-    if message_id in _edited_message_cache:
-        if now - _edited_message_cache[message_id] < _EDIT_DEDUP_WINDOW:
-            return False
-    _edited_message_cache[message_id] = now
-    return True
 
 
 def _ensure_view(key, factory):
@@ -612,10 +609,6 @@ def build_log_layout(title, fields=None, footer=None):
         container.add_item(discord.ui.TextDisplay(f))
     layout = discord.ui.LayoutView(timeout=None)
     layout.add_item(container)
-    try:
-        layout._log_meta = {'title': title, 'fields': list(fields or []), 'footer': footer}
-    except Exception:
-        pass
     return layout
 
 
@@ -626,20 +619,18 @@ def staff_footer(member):
     return f"{label}: {member} | {member.id}"
 
 
-async def send_log_layout(layout, channel_id, guild=None):
+async def send_log_layout(layout, channel_id, guild=None, dedup_key=None):
     if guild and not is_target_guild(guild):
         return
-    meta = getattr(layout, '_log_meta', None)
-    if meta:
-        dedup_key = _make_dedup_key(channel_id, meta.get('title'), meta.get('fields'), meta.get('footer'))
-        if not _should_send_log(channel_id, dedup_key):
+    if dedup_key:
+        if log_manager.is_duplicate(f"{channel_id}:{dedup_key}"):
             return
     channel = bot.get_channel(channel_id)
     if channel:
         try:
             await channel.send(view=layout)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[SEND LOG ERROR] {e}")
 
 
 async def send_dm(user, embed, view=None):
@@ -652,9 +643,12 @@ async def send_dm(user, embed, view=None):
         pass
 
 
-async def send_log(embed, channel_id, guild=None):
+async def send_log(embed, channel_id, guild=None, dedup_key=None):
     if guild and not is_target_guild(guild):
         return
+    if dedup_key:
+        if log_manager.is_duplicate(f"{channel_id}:{dedup_key}"):
+            return
     channel = bot.get_channel(channel_id)
     if channel:
         try:
@@ -843,7 +837,10 @@ async def tempban_watcher():
                                         ("Причина", "Истечение времени бана"),
                                     ]
                                 )
-                                await send_log_layout(layout, LOG_ALL_CHANNEL_ID, guild)
+                                await send_log_layout(
+                                    layout, LOG_ALL_CHANNEL_ID, guild,
+                                    dedup_key=f"auto_unban_{b.get('user_id', 0)}_{int(b.get('unban_at', 0))}"
+                                )
                             except Exception:
                                 pass
                         changed = True
@@ -893,6 +890,7 @@ async def check_raid_status():
 async def set_raid_status(guild, new_status, status, moderator=None):
     if not is_target_guild(guild):
         return
+    old_status = status.get('status', ANTI_RAID_GREEN)
     status['status'] = new_status
     if moderator:
         footer = staff_footer(moderator)
@@ -909,7 +907,8 @@ async def set_raid_status(guild, new_status, status, moderator=None):
             ],
             footer=footer
         )
-        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, guild)
+        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, guild,
+                              dedup_key=f"raid_{guild.id}_{old_status}_to_{new_status}")
     elif new_status == ANTI_RAID_RED:
         status['red_until'] = datetime.now(timezone.utc).timestamp() + RED_DURATION
         await setup_raid_red(guild, status)
@@ -922,7 +921,8 @@ async def set_raid_status(guild, new_status, status, moderator=None):
             ],
             footer=footer
         )
-        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, guild)
+        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, guild,
+                              dedup_key=f"raid_{guild.id}_{old_status}_to_{new_status}")
     elif new_status == ANTI_RAID_GREEN:
         status['manual_lockdown'] = False
         status['red_until'] = None
@@ -936,7 +936,8 @@ async def set_raid_status(guild, new_status, status, moderator=None):
             ],
             footer=footer
         )
-        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, guild)
+        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, guild,
+                              dedup_key=f"raid_{guild.id}_{old_status}_to_{new_status}")
     save_raid_state()
 
 
@@ -1236,7 +1237,7 @@ def build_punishment_appeal_container(record):
         'mute': 'Мут', 'warn': 'Предупреждение', 'kick': 'Кик',
         'ban': 'Бан', 'tempban': 'Временный бан',
         'auto_mute_spam': 'Автомут за спам', 'auto_ban_spam': 'Автобан за спам',
-        'auto_mute_invite': 'Автомуt за ссылку', 'auto_mute_warns': 'Автомут за 3 варна'
+        'auto_mute_invite': 'Автомут за ссылку', 'auto_mute_warns': 'Автомут за 3 варна'
     }
     type_label = type_labels.get(record.get('type', ''), record.get('type', ''))
 
@@ -1360,6 +1361,13 @@ def register_persistent_views():
         ))
     except Exception as e:
         print(f"register formtik: {e}")
+
+    try:
+        _ensure_view("form_statement_buttons", lambda: _make_view(
+            ContentCreatorApplyButton()
+        ))
+    except Exception as e:
+        print(f"register formstatement: {e}")
 
     try:
         tickets_data = load_tickets()
@@ -1497,7 +1505,7 @@ async def on_command_error(ctx, error):
 async def on_ready():
     global _on_ready_count, _synced_once
     _on_ready_count += 1
-    print(f"on_ready fired #{_on_ready_count} (PID={os.getpid()})")
+    print(f"=== on_ready fired #{_on_ready_count} pid={os.getpid()} ===")
 
     restore_raid_state()
     _start_background_tasks()
@@ -1506,6 +1514,7 @@ async def on_ready():
         try:
             await bot.tree.sync()
             _synced_once = True
+            print("tree synced")
         except Exception as e:
             print(f"tree sync: {e}")
 
@@ -1588,7 +1597,8 @@ async def on_member_join(member):
             ("Создал приглашение", inviter_text),
         ]
     )
-    await send_log_layout(layout, LOG_INVITE_CHANNEL_ID, member.guild)
+    await send_log_layout(layout, LOG_INVITE_CHANNEL_ID, member.guild,
+                          dedup_key=f"join_{member.id}_{int(member.joined_at.timestamp()) if member.joined_at else 0}")
 
     if status_now['status'] == ANTI_RAID_RED:
         dm_embed = base_embed("Сервер в режиме антирейда", COLOR_ACCENT)
@@ -1631,7 +1641,8 @@ async def on_member_remove(member):
             ("Участник", member.mention),
         ]
     )
-    await send_log_layout(layout, LOG_INVITE_CHANNEL_ID, member.guild)
+    await send_log_layout(layout, LOG_INVITE_CHANNEL_ID, member.guild,
+                          dedup_key=f"leave_{member.id}_{int(time.time() // 5)}")
 
 
 @bot.event
@@ -1690,7 +1701,8 @@ async def on_message(message):
                     ],
                     footer=f"Модератор: {bot.user} | {bot.user.id}"
                 )
-                await send_log_layout(layout, LOG_ALL_CHANNEL_ID, message.guild)
+                await send_log_layout(layout, LOG_ALL_CHANNEL_ID, message.guild,
+                                      dedup_key=f"auto_invite_{record['id']}")
             else:
                 err_layout = build_log_layout(
                     "Не удалось выдать мут за ссылку на Discord-сервер",
@@ -1700,7 +1712,8 @@ async def on_message(message):
                     ],
                     footer=f"Модератор: {bot.user} | {bot.user.id}"
                 )
-                await send_log_layout(err_layout, LOG_ALL_CHANNEL_ID, message.guild)
+                await send_log_layout(err_layout, LOG_ALL_CHANNEL_ID, message.guild,
+                                      dedup_key=f"auto_invite_err_{message.id}")
         except Exception:
             pass
         return
@@ -1735,8 +1748,6 @@ async def on_message(message):
                     to_purge.append(m)
                     if len(to_purge) >= SPAM_LIMIT:
                         break
-            for m in to_purge:
-                _deleted_message_cache[m.id] = time.time()
             if to_purge:
                 try:
                     await message.channel.delete_messages(to_purge)
@@ -1786,7 +1797,8 @@ async def on_message(message):
                     ],
                     footer=f"Модератор: {bot.user} | {bot.user.id}"
                 )
-                await send_log_layout(layout, LOG_ALL_CHANNEL_ID, message.guild)
+                await send_log_layout(layout, LOG_ALL_CHANNEL_ID, message.guild,
+                                      dedup_key=f"auto_spam_{record['id']}")
             except Exception:
                 pass
 
@@ -1815,7 +1827,8 @@ async def on_message(message):
                             ],
                             footer=f"Модератор: {bot.user} | {bot.user.id}"
                         )
-                        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, message.guild)
+                        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, message.guild,
+                                              dedup_key=f"auto_ban_{record2['id']}")
                     except Exception:
                         pass
         else:
@@ -1827,7 +1840,8 @@ async def on_message(message):
                 ],
                 footer=f"Модератор: {bot.user} | {bot.user.id}"
             )
-            await send_log_layout(err_layout, LOG_ALL_CHANNEL_ID, message.guild)
+            await send_log_layout(err_layout, LOG_ALL_CHANNEL_ID, message.guild,
+                                  dedup_key=f"auto_spam_err_{message.id}")
 
 
 @bot.event
@@ -1837,8 +1851,6 @@ async def on_message_edit(before, after):
     if not is_target_guild(before.guild):
         return
     if before.content == after.content:
-        return
-    if not _should_process_edited(before.id):
         return
 
     before_text = before.content if before.content else "*(пусто)*"
@@ -1853,7 +1865,8 @@ async def on_message_edit(before, after):
             ("Стало", after_text),
         ]
     )
-    await send_log_layout(layout, LOG_CHAT_CHANNEL_ID, before.guild)
+    await send_log_layout(layout, LOG_CHAT_CHANNEL_ID, before.guild,
+                          dedup_key=f"edit_{before.id}_{int(time.time() // 5)}")
 
 
 @bot.event
@@ -1861,8 +1874,6 @@ async def on_message_delete(message):
     if message.author.bot or not message.guild:
         return
     if not is_target_guild(message.guild):
-        return
-    if not _should_process_deleted(message.id):
         return
 
     deleter_text = "Неизвестно"
@@ -1885,7 +1896,8 @@ async def on_message_delete(message):
             ("Содержимое", content),
         ]
     )
-    await send_log_layout(layout, LOG_CHAT_CHANNEL_ID, message.guild)
+    await send_log_layout(layout, LOG_CHAT_CHANNEL_ID, message.guild,
+                          dedup_key=f"del_{message.id}")
 
 
 @bot.event
@@ -1902,7 +1914,10 @@ async def on_member_update(before, after):
                 ("Новый ник", after.nick or after.name),
             ]
         )
-        await send_log_layout(layout, LOG_CHAT_CHANNEL_ID, before.guild)
+        await send_log_layout(
+            layout, LOG_CHAT_CHANNEL_ID, before.guild,
+            dedup_key=f"nick_{before.id}_{before.nick}_{after.nick}"
+        )
 
 
 @bot.event
@@ -1918,7 +1933,8 @@ async def on_guild_channel_create(channel):
         ],
         footer=staff_footer(actor) if actor else "Модератор: Неизвестно"
     )
-    await send_log_layout(layout, LOG_ALL_CHANNEL_ID, channel.guild)
+    await send_log_layout(layout, LOG_ALL_CHANNEL_ID, channel.guild,
+                          dedup_key=f"ch_create_{channel.id}")
 
 
 @bot.event
@@ -1934,7 +1950,8 @@ async def on_guild_channel_delete(channel):
         ],
         footer=staff_footer(actor) if actor else "Модератор: Неизвестно"
     )
-    await send_log_layout(layout, LOG_ALL_CHANNEL_ID, channel.guild)
+    await send_log_layout(layout, LOG_ALL_CHANNEL_ID, channel.guild,
+                          dedup_key=f"ch_delete_{channel.id}")
 
 
 @bot.event
@@ -1951,7 +1968,10 @@ async def on_guild_channel_update(before, after):
             ],
             footer=staff_footer(actor) if actor else "Модератор: Неизвестно"
         )
-        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, before.guild)
+        await send_log_layout(
+            layout, LOG_ALL_CHANNEL_ID, before.guild,
+            dedup_key=f"ch_upd_{before.id}_{before.name}_{after.name}"
+        )
 
 
 @bot.event
@@ -1967,7 +1987,8 @@ async def on_guild_role_create(role):
         ],
         footer=staff_footer(actor) if actor else "Модератор: Неизвестно"
     )
-    await send_log_layout(layout, LOG_ALL_CHANNEL_ID, role.guild)
+    await send_log_layout(layout, LOG_ALL_CHANNEL_ID, role.guild,
+                          dedup_key=f"role_create_{role.id}")
 
 
 @bot.event
@@ -1982,7 +2003,8 @@ async def on_guild_role_delete(role):
         ],
         footer=staff_footer(actor) if actor else "Модератор: Неизвестно"
     )
-    await send_log_layout(layout, LOG_ALL_CHANNEL_ID, role.guild)
+    await send_log_layout(layout, LOG_ALL_CHANNEL_ID, role.guild,
+                          dedup_key=f"role_delete_{role.id}")
 
 
 @bot.event
@@ -1999,7 +2021,127 @@ async def on_guild_role_update(before, after):
             ],
             footer=staff_footer(actor) if actor else "Модератор: Неизвестно"
         )
-        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, before.guild)
+        await send_log_layout(
+            layout, LOG_ALL_CHANNEL_ID, before.guild,
+            dedup_key=f"role_upd_{before.id}_{before.name}_{after.name}"
+        )
+
+
+class ContentCreatorModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="Заявление на контент креатора")
+        
+        self.roblox = discord.ui.TextInput(
+            label="Ваш roblox @username",
+            required=True,
+            max_length=100
+        )
+        self.channel = discord.ui.TextInput(
+            label="Ваш YouTube/TikTok канал",
+            required=True,
+            max_length=200
+        )
+        
+        self.agree = discord.ui.Checkbox(
+            custom_id="agree_rules",
+            default=False
+        )
+        
+        self.add_item(self.roblox)
+        self.add_item(self.channel)
+        self.add_item(discord.ui.Label(
+            text="Соответствуете ли вы критериям?",
+            component=self.agree
+        ))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        
+        if not self.agree.value:
+            return
+            
+        channel = bot.get_channel(1568714654090264586)
+        if channel:
+            container = discord.ui.Container()
+            container.add_item(discord.ui.TextDisplay("**Заявление на контент креатора**"))
+            container.add_item(discord.ui.Separator())
+            container.add_item(discord.ui.TextDisplay(f"<@&1491372311310368818> <@&1508078492552663141>"))
+            container.add_item(discord.ui.Separator())
+            container.add_item(discord.ui.TextDisplay(
+                f"**Подал:** <@{interaction.user.id}>\n\n"
+                f"**Roblox:** {self.roblox.value}\n\n"
+                f"**YouTube/TikTok:** {self.channel.value}"
+            ))
+            container.add_item(discord.ui.Separator())
+            
+            layout = discord.ui.LayoutView(timeout=None)
+            layout.add_item(container)
+            
+            await channel.send(view=layout)
+
+
+class ContentCreatorApplyButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Подать заявку",
+            style=discord.ButtonStyle.secondary,
+            custom_id="content_creator_apply_btn"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_target_guild(interaction.guild):
+            await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
+            return
+        
+        modal = ContentCreatorModal()
+        await interaction.response.send_modal(modal)
+
+
+@bot.command(name="formstatement")
+async def formstatement(ctx):
+    if not is_target_guild(ctx.guild):
+        await ctx.send(ERR_UNAVAILABLE)
+        return
+
+    if not is_admin(ctx.author):
+        await ctx.send(ERR_UNAVAILABLE)
+        return
+
+    container = discord.ui.Container()
+    container.add_item(discord.ui.TextDisplay("<:YouTube_Logo:1568669649728442518> **Заявление на контент креатора**"))
+    container.add_item(discord.ui.Separator())
+    
+    criteria = (
+        "**Критерии:**\n\n"
+        "1. 50–100 подписчиков на YouTube или в TikTok;\n"
+        "2. Подписка на наш Telegram-канал и Discord-сервер;\n"
+        "3. Тематика канала/аккаунта - Roblox; наличие 1–2 видео о нашем режиме и выпуск новых видео о нём не реже 1 раза в 14 дней;\n"
+        "4. Отсутствие ранее полученных наказаний и фактов использования читов."
+    )
+    container.add_item(discord.ui.TextDisplay(criteria))
+    container.add_item(discord.ui.Separator())
+    
+    rewards = (
+        "**Что вы получаете:**\n\n"
+        "1. Роль content creator;\n"
+        "2. Эксклюзивный игровой тег;\n"
+        "3. Эксклюзивный персонаж."
+    )
+    container.add_item(discord.ui.TextDisplay(rewards))
+    container.add_item(discord.ui.Separator())
+    
+    container.add_item(discord.ui.ActionRow(ContentCreatorApplyButton()))
+    container.add_item(discord.ui.Separator())
+    
+    layout = discord.ui.LayoutView(timeout=None)
+    layout.add_item(container)
+    
+    await ctx.send(view=layout)
+    await ctx.message.delete()
+
+    _ensure_view("form_statement_buttons", lambda: _make_view(
+        ContentCreatorApplyButton()
+    ))
 
 
 class TicketModal(discord.ui.Modal):
@@ -2267,6 +2409,8 @@ class VerdictButton(discord.ui.Button):
         self.kind = kind
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_mod(interaction.user):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -2392,6 +2536,8 @@ class ChangeVerdictButton(discord.ui.Button):
         self.kind = kind
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_admin(interaction.user):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -2472,6 +2618,8 @@ class DeleteTicketButton(discord.ui.Button):
         self.kind = kind
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_admin(interaction.user):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -2512,6 +2660,8 @@ class DeleteVerdictButton(discord.ui.Button):
         self.kind = kind
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_admin(interaction.user):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -2592,6 +2742,8 @@ class AppealButton(discord.ui.Button):
         self.ticket_number = ticket_number
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         await interaction.response.send_modal(AppealModal(self.ticket_number))
 
 
@@ -2663,6 +2815,8 @@ class AppealVerdictButton(discord.ui.Button):
         self.ticket_number = ticket_number
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_admin(interaction.user):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -2741,6 +2895,8 @@ class AppealChangeVerdictButton(discord.ui.Button):
         self.ticket_number = ticket_number
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_admin(interaction.user):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -2824,6 +2980,8 @@ class AppealDeleteVerdictButton(discord.ui.Button):
         self.ticket_number = ticket_number
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_admin(interaction.user):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -2879,6 +3037,8 @@ class ComplaintButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_target_guild(interaction.guild):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -2896,6 +3056,8 @@ class ModerationComplaintButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_target_guild(interaction.guild):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -3075,6 +3237,8 @@ class TiketQuestionButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_target_guild(interaction.guild):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -3092,6 +3256,8 @@ class TiketBugButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_target_guild(interaction.guild):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -3109,6 +3275,8 @@ class TiketSuggestionButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_target_guild(interaction.guild):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -3160,6 +3328,8 @@ class RoleButton(discord.ui.Button):
         self.role = role
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_target_guild(interaction.guild):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -3589,7 +3759,7 @@ async def mute(interaction: discord.Interaction, user: discord.Member, amount: i
             ],
             footer=staff_footer(interaction.user)
         )
-        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild)
+        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild, dedup_key=f"mute_{record['id']}")
     except Exception:
         try:
             await interaction.followup.send(ERR_ACTION, ephemeral=True)
@@ -3622,7 +3792,7 @@ async def unmute(interaction: discord.Interaction, user: discord.Member, reason:
             ],
             footer=staff_footer(interaction.user)
         )
-        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild)
+        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild, dedup_key=f"unmute_{user.id}_{int(time.time() // 5)}")
     except Exception:
         try:
             await interaction.followup.send(ERR_ACTION, ephemeral=True)
@@ -3683,7 +3853,7 @@ async def kick(interaction: discord.Interaction, user: discord.Member, reason: s
             ],
             footer=staff_footer(interaction.user)
         )
-        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild)
+        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild, dedup_key=f"kick_{record['id']}")
 
         await user.kick(reason=reason)
     except discord.Forbidden:
@@ -3756,7 +3926,7 @@ async def ban(interaction: discord.Interaction, user: discord.Member, reason: st
             ],
             footer=staff_footer(interaction.user)
         )
-        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild)
+        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild, dedup_key=f"ban_{record['id']}")
 
         await user.ban(reason=reason, delete_message_days=delete_message_days)
     except discord.Forbidden:
@@ -3793,7 +3963,7 @@ async def unban(interaction: discord.Interaction, user_id: str, reason: str = "�
             ],
             footer=staff_footer(interaction.user)
         )
-        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild)
+        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild, dedup_key=f"unban_{user.id}_{int(time.time() // 5)}")
     except Exception:
         try:
             await interaction.followup.send(ERR_ACTION, ephemeral=True)
@@ -3862,7 +4032,7 @@ async def tempban(interaction: discord.Interaction, user: discord.Member, days: 
             ],
             footer=staff_footer(interaction.user)
         )
-        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild)
+        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild, dedup_key=f"tempban_{record['id']}")
 
         await user.ban(reason=reason)
 
@@ -3935,7 +4105,7 @@ async def warn(interaction: discord.Interaction, user: discord.Member, reason: s
             ],
             footer=staff_footer(interaction.user)
         )
-        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild)
+        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild, dedup_key=f"warn_{record['id']}")
 
         if warn_count >= MAX_WARNS:
             try:
@@ -3962,7 +4132,7 @@ async def warn(interaction: discord.Interaction, user: discord.Member, reason: s
                         ("Причина", "Получено 3 предупреждения"),
                     ]
                 )
-                await send_log_layout(auto_layout, LOG_ALL_CHANNEL_ID, interaction.guild)
+                await send_log_layout(auto_layout, LOG_ALL_CHANNEL_ID, interaction.guild, dedup_key=f"auto_warns_{record2['id']}")
             except Exception:
                 pass
     except Exception:
@@ -4003,7 +4173,7 @@ async def unwarn(interaction: discord.Interaction, user: discord.Member, reason:
             ],
             footer=staff_footer(interaction.user)
         )
-        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild)
+        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild, dedup_key=f"unwarn_{user.id}_{int(time.time() // 5)}")
     except Exception:
         try:
             await interaction.followup.send(ERR_ACTION, ephemeral=True)
@@ -4070,7 +4240,7 @@ async def clear(interaction: discord.Interaction, amount: int, user: discord.Mem
             ],
             footer=staff_footer(interaction.user)
         )
-        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild)
+        await send_log_layout(layout, LOG_ALL_CHANNEL_ID, interaction.guild, dedup_key=f"clear_{interaction.channel.id}_{int(time.time() // 5)}")
         await interaction.followup.send("Готово", ephemeral=True)
     except Exception:
         await interaction.followup.send(ERR_ACTION, ephemeral=True)
@@ -4087,6 +4257,8 @@ class PunishmentAppealButton(discord.ui.Button):
         self.appeal_id = appeal_id
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         data = load_punishment_appeals()
         record = None
         for r in data.get('appeals', []):
@@ -4185,6 +4357,8 @@ class PunishmentAppealVerdictButton(discord.ui.Button):
         self.appeal_id = appeal_id
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_admin(interaction.user):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -4266,6 +4440,8 @@ class PunishmentAppealChangeVerdictButton(discord.ui.Button):
         self.appeal_id = appeal_id
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_admin(interaction.user):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -4353,6 +4529,8 @@ class PunishmentAppealDeleteVerdictButton(discord.ui.Button):
         self.appeal_id = appeal_id
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.response.is_done():
+            return
         if not is_admin(interaction.user):
             await interaction.response.send_message(ERR_UNAVAILABLE, ephemeral=True)
             return
@@ -4406,7 +4584,7 @@ class PunishmentAppealDeleteVerdictButton(discord.ui.Button):
 if __name__ == "__main__":
     TOKEN = os.getenv("DISCORD_TOKEN")
     if not TOKEN:
-        print("Коля пизда.")
+        print("Токен не найден.")
     else:
-        print(f"Starting bot (PID={os.getpid()})")
+        print(f"Запуск бота (PID={os.getpid()})")
         bot.run(TOKEN)
